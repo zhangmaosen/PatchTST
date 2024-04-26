@@ -16,6 +16,7 @@ data_name=custom
 random_seed=2021
 for pred_len in 96 192 336 720
 do
+    timestamp=$(date +%Y%m%d_%H%M%S)
     python -u run_longExp.py \
       --random_seed $random_seed \
       --is_training 1 \
@@ -40,5 +41,7 @@ do
       --des 'Exp' \
       --train_epochs 100\
       --patience 20\
-      --itr 1 --batch_size 128 --learning_rate 0.0001 >logs/LongForecasting/$model_name'_'$model_id_name'_'$seq_len'_'$pred_len.log 
+      --itr 1 --batch_size 128 --learning_rate 0.0001 >logs/LongForecasting/$timestamp'_'$model_name'_'$model_id_name'_'$seq_len'_'$pred_len.log 
 done
+
+      #--use_multi_gpu \
