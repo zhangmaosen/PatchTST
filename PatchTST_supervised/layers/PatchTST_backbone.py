@@ -13,6 +13,63 @@ from layers.PatchTST_layers import *
 from layers.RevIN import RevIN
 import torch.nn.functional as F
 
+class UNet(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super(UNet, self).__init__()
+
+        def conv_block(in_channels, out_channels):
+            return nn.Sequential(
+                nn.Conv1d(in_channels, out_channels, 3, padding=1),
+                nn.ReLU(inplace=True),
+                nn.Conv1d(out_channels, out_channels, 3, padding=1),
+                nn.ReLU(inplace=True)
+            )   
+
+        self.encoder1 = conv_block(in_channels, 64)
+        self.pool1 = nn.MaxPool1d(2, 2)
+        self.encoder2 = conv_block(64, 128)
+        self.pool2 = nn.MaxPool1d(2, 2)
+        self.encoder3 = conv_block(128, 256)
+        self.pool3 = nn.MaxPool1d(2, 2)
+        self.encoder4 = conv_block(256, 512)
+        self.pool4 = nn.MaxPool1d(2, 2)
+
+        self.bottleneck = conv_block(512, 1024)
+
+        self.upconv4 = nn.ConvTranspose1d(1024, 512, 2, stride=2)
+        self.decoder4 = conv_block(1024, 512)
+        self.upconv3 = nn.ConvTranspose1d(512, 256, 2, stride=2)
+        self.decoder3 = conv_block(512, 256)
+        self.upconv2 = nn.ConvTranspose1d(256, 128, 2, stride=2)
+        self.decoder2 = conv_block(256, 128)
+        self.upconv1 = nn.ConvTranspose1d(128, 64, 2, stride=2)
+        self.decoder1 = conv_block(128, 64)
+
+        self.output = nn.Conv1d(64, out_channels, 1)
+
+    def forward(self, x):
+        enc1 = self.encoder1(x)
+        enc2 = self.encoder2(self.pool1(enc1))
+        enc3 = self.encoder3(self.pool2(enc2))
+        enc4 = self.encoder4(self.pool3(enc3))
+
+        bottleneck = self.bottleneck(self.pool4(enc4))
+
+        dec4 = self.upconv4(bottleneck)
+        dec4 = torch.cat((dec4, enc4), dim=1)
+        dec4 = self.decoder4(dec4)
+        dec3 = self.upconv3(dec4)
+        dec3 = torch.cat((dec3, enc3), dim=1)
+        dec3 = self.decoder3(dec3)
+        dec2 = self.upconv2(dec3)
+        dec2 = torch.cat((dec2, enc2), dim=1)
+        dec2 = self.decoder2(dec2)
+        dec1 = self.upconv1(dec2)
+        dec1 = torch.cat((dec1, enc1), dim=1)
+        dec1 = self.decoder1(dec1)
+
+        return self.output(dec1)    
+
 # Cell
 class PatchTST_backbone(nn.Module):
     def __init__(self, c_in:int, context_window:int, target_window:int, patch_len:int, stride:int, max_seq_len:Optional[int]=1024, 
@@ -25,10 +82,12 @@ class PatchTST_backbone(nn.Module):
         
         super().__init__()
         
+        scale_factor = 1
+        c_in = c_in * scale_factor # 2 * c_in
         # RevIn
         self.revin = revin
-        if self.revin: self.revin_layer = RevIN(c_in, affine=affine, subtract_last=subtract_last)
-        
+        if self.revin: self.revin_layer = RevIN(int(c_in/scale_factor), affine=affine, subtract_last=subtract_last)
+        #if self.revin: self.revin_layer2 = RevIN(int(c_in/2), affine=affine, subtract_last=subtract_last)
         # Patching
         self.patch_len = patch_len
         self.stride = stride
@@ -57,14 +116,22 @@ class PatchTST_backbone(nn.Module):
         elif head_type == 'flatten': 
             self.head = Flatten_Head(self.individual, self.n_vars, self.head_nf, target_window, head_dropout=head_dropout)
         
+        # self.unet = UNet(int(c_in/scale_factor), int((c_in/scale_factor)*(scale_factor-1)))
+        # self.descale = nn.Linear(c_in, int(c_in/scale_factor))
     
-    def forward(self, z):                                                                   # z: [bs x nvars x seq_len]
+    def forward(self, z):      
+        # multi scale signal extract
+
+                                                                   # z: [bs x nvars x seq_len]
         # norm
         if self.revin: 
             z = z.permute(0,2,1)
             z = self.revin_layer(z, 'norm')
             z = z.permute(0,2,1)
-            
+
+        # multi_scale_z = self.unet(z)
+        # z = torch.cat((z, multi_scale_z), dim=1)
+        #z = z + multi_scale_z
         # do patching
         if self.padding_patch == 'end':
             z = self.padding_patch_layer(z)
@@ -73,13 +140,16 @@ class PatchTST_backbone(nn.Module):
         
         # model
         z = self.backbone(z)                                                                # z: [bs x nvars x d_model x patch_num]
-        z = self.head(z)                                                                    # z: [bs x nvars x target_window] 
+        z = self.head(z)                                                               # z: [bs x nvars x target_window] 
         
+
         # denorm
         if self.revin: 
             z = z.permute(0,2,1)
+            # z = self.descale(z)
             z = self.revin_layer(z, 'denorm')
             z = z.permute(0,2,1)
+
         return z
     
     def create_pretrain_head(self, head_nf, vars, dropout):
@@ -124,90 +194,6 @@ class Flatten_Head(nn.Module):
         return x
         
         
-class UNet(nn.Module):
-    def __init__(self, in_channels, out_channels):
-        super(UNet, self).__init__()
-
-        def conv_block(in_channels, out_channels):
-            return nn.Sequential(
-                nn.Conv1d(in_channels, out_channels, 3, padding=1),
-                nn.ReLU(inplace=True),
-                nn.Conv1d(out_channels, out_channels, 3, padding=1),
-                nn.ReLU(inplace=True)
-            )   
-
-        self.encoder1 = conv_block(in_channels, 64)
-        self.pool1 = nn.MaxPool1d(2, 2)
-        self.encoder2 = conv_block(64, 128)
-        self.pool2 = nn.MaxPool1d(2, 2)
-        self.encoder3 = conv_block(128, 256)
-        self.pool3 = nn.MaxPool1d(2, 2)
-        self.encoder4 = conv_block(256, 512)
-        self.pool4 = nn.MaxPool1d(2, 2)
-
-        self.bottleneck = conv_block(512, 1024)
-
-        self.upconv4 = nn.ConvTranspose1d(1024, 512, 2, stride=2)
-        self.decoder4 = conv_block(1024, 512)
-        self.upconv3 = nn.ConvTranspose1d(512, 256, 2, stride=2)
-        self.decoder3 = conv_block(512, 256)
-        self.upconv2 = nn.ConvTranspose1d(256, 128, 2, stride=2)
-        self.decoder2 = conv_block(256, 128)
-        self.upconv1 = nn.ConvTranspose1d(128, 64, 2, stride=2)
-        self.decoder1 = conv_block(128, 64)
-
-        self.output = nn.Conv1d(64, out_channels, 1)
-
-        self.o5 = nn.Conv1d(1024, in_channels, 1)
-        self.o4 = nn.Conv1d(512, in_channels,1)
-        self.o3 = nn.Conv1d(256, in_channels,1)
-        self.o2 = nn.Conv1d(128, in_channels,1)
-        self.o1 = nn.Conv1d(64, in_channels,1)
-        self.all_out = nn.Linear(6*in_channels, in_channels) 
-    def forward(self, x):
-        enc1 = self.encoder1(x)
-        enc2 = self.encoder2(self.pool1(enc1))
-        enc3 = self.encoder3(self.pool2(enc2))
-        enc4 = self.encoder4(self.pool3(enc3))
-
-        bottleneck = self.bottleneck(self.pool4(enc4))
-
-
-
-        bottleneck_up_scale = F.interpolate(bottleneck, scale_factor=16, mode='nearest')
-        bottleneck_up_scale = self.o5(bottleneck_up_scale)
-
-        enc4 = F.interpolate(enc4, scale_factor=8, mode='nearest')
-        enc4 = self.o4(enc4)
-
-        enc3 = F.interpolate(enc3, scale_factor=4, mode='nearest')
-        enc3 = self.o3(enc3)
-
-        enc2 = F.interpolate(enc2, scale_factor=2, mode='nearest')
-        enc2 = self.o2(enc2)
-
-        enc1 = self.o1(enc1)
-        all = torch.cat((x, enc1, enc2, enc3, enc4, bottleneck_up_scale), dim=1)
-        
-        all = all.permute(0,2,1)
-        #print(f'all shape {all.shape}')
-        out_all_scale = self.all_out(all)
-        out_all_scale = out_all_scale.permute(0,2,1)
-        # dec4 = self.upconv4(bottleneck)
-        # dec4 = torch.cat((dec4, enc4), dim=1)
-        # dec4 = self.decoder4(dec4)
-        # dec3 = self.upconv3(dec4)
-        # dec3 = torch.cat((dec3, enc3), dim=1)
-        # dec3 = self.decoder3(dec3)
-        # dec2 = self.upconv2(dec3)
-        # dec2 = torch.cat((dec2, enc2), dim=1)
-        # dec2 = self.decoder2(dec2)
-        # dec1 = self.upconv1(dec2)
-        # dec1 = torch.cat((dec1, enc1), dim=1)
-        # dec1 = self.decoder1(dec1)
-
-        return out_all_scale
-        #return self.output(dec1)    
     
 class TSTiEncoder(nn.Module):  #i means channel-independent
     def __init__(self, c_in, patch_num, patch_len, max_seq_len=1024,
@@ -225,10 +211,12 @@ class TSTiEncoder(nn.Module):  #i means channel-independent
         # Input encoding
         q_len = patch_num
         self.W_P = nn.Linear(patch_len, d_model)        # Eq 1: projection of feature vectors onto a d-dim vector space
+        self.W_P_1 = nn.Linear(patch_len, d_model) 
         self.seq_len = q_len
         # add unet todo list
-        #self.unet = UNet(21, 21)
-        #self.unet_linear = nn.Linear(5376, d_model)
+        self.unet = UNet(c_in, c_in)
+        self.unet_2 = UNet(c_in, c_in)
+        self.unet_linear = nn.Linear(5376, d_model)
         # Positional encoding
         self.W_pos = positional_encoding(pe, learn_pe, q_len, d_model)
 
@@ -243,29 +231,25 @@ class TSTiEncoder(nn.Module):  #i means channel-independent
     def forward(self, x) -> Tensor:                                              # x: [bs x nvars x patch_len x patch_num]
         
         n_vars = x.shape[1]
+        
+        
         # Input encoding
         x = x.permute(0,1,3,2)   
-                                                        # x: [bs x nvars x patch_num x patch_len]
-        # x_unet = x.reshape(x.shape[0],x.shape[1], -1)   
-        # x_unet = self.unet(x_unet)           
-        # #print(f'x shape is {x.shape} \nx_unet shape is {x_unet.shape}')  
 
-        # #x_unet = self.unet_linear(x_unet)
-        # x_unet = x_unet.reshape(x.shape[0],x.shape[1],x.shape[2], -1)
-        # #print(f'x shape is {x.shape} \n x_unet shape is {x_unet.shape}')                             # x: [bs x nvars x patch_num x d_model]
-        # #x = x + x_unet
-        # x = x + x_unet
+        orig_x = x.reshape(x.shape[0], x.shape[1], -1)
+        orig_x = self.unet(orig_x)
+        orig_x = orig_x.reshape(x.shape[0], x.shape[1], x.shape[2], -1)
+        x = self.W_P(x)  + self.W_P_1(orig_x)
 
-        x = self.W_P(x)            
         
-
-
-
+        #orig_x = self.unet_linear(orig_x)
+        #x = x + orig_x
         u = torch.reshape(x, (x.shape[0]*x.shape[1],x.shape[2],x.shape[3]))      # u: [bs * nvars x patch_num x d_model]
         u = self.dropout(u + self.W_pos)                                         # u: [bs * nvars x patch_num x d_model]
 
         # Encoder
-        z = self.encoder(u)                                                      # z: [bs * nvars x patch_num x d_model]
+        z = self.encoder(u)      
+                                                     # z: [bs * nvars x patch_num x d_model]
         z = torch.reshape(z, (-1,n_vars,z.shape[-2],z.shape[-1]))                # z: [bs x nvars x patch_num x d_model]
         z = z.permute(0,1,3,2)                                                   # z: [bs x nvars x d_model x patch_num]
         
