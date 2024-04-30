@@ -117,18 +117,28 @@ class PatchTST_backbone(nn.Module):
         elif head_type == 'flatten': 
             self.head = Flatten_Head(self.individual, self.n_vars, self.head_nf, target_window, head_dropout=head_dropout)
         
-        
+        self.multi_scale = 15
+        self.unet = UNet(1, self.multi_scale)
     def forward(self, z):                                                                   # z: [bs x nvars x seq_len]
         # norm
         if self.revin: 
             z = z.permute(0,2,1)
             z = self.revin_layer(z, 'norm')
             z = z.permute(0,2,1)
-            
+
+        multi_z = z.reshape(z.shape[0]*z.shape[1], -1)    
+        multi_z = self.unet(multi_z)
+        multi_z = multi_z.reshape(z.shape[0], z.shape[1], self.multi_scale, -1)
         # do patching
         if self.padding_patch == 'end':
             z = self.padding_patch_layer(z)
+            multi_z = self.padding_patch_layer(multi_z)
+
         z = z.unfold(dimension=-1, size=self.patch_len, step=self.stride)                   # z: [bs x nvars x patch_num x patch_len]
+        origin_z = z.reshape(z.shape[0], z.shape[1], 1, -1, self.patch_len)
+        multi_z = multi_z.unfold(dimension=-1, size=self.patch_len, step=self.stride)
+
+        all_z = torch.cat((origin_z, multi_z), dim=2)
         z = z.permute(0,1,3,2)                                                              # z: [bs x nvars x patch_len x patch_num]
         
         # model
