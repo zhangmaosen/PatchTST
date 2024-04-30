@@ -15,6 +15,27 @@ from layers.RevIN import RevIN
 # Unet test
 import torch
 import torch.nn as nn
+
+
+class VGGTimeSeries(nn.Module):
+    def __init__(self, input_dim, hidden_dim, output_dim):
+        super(VGGTimeSeries, self).__init__()
+        self.conv1 = nn.Conv1d(input_dim, hidden_dim, kernel_size=3, padding=1)
+        self.conv2 = nn.Conv1d(hidden_dim, hidden_dim, kernel_size=3, padding=1)
+        self.pool = nn.MaxPool1d(kernel_size=2, stride=2)
+        self.relu = nn.ReLU()
+        self.fc = nn.Linear(hidden_dim, output_dim)
+
+    def forward(self, x):
+        x = self.conv1(x)
+        x = self.relu(x)
+        x = self.conv2(x)
+        x = self.relu(x)
+        x = self.pool(x)
+        x = x.view(x.size(0), -1)  # flatten
+        x = self.fc(x)
+        return x
+    
 class UNet(nn.Module):
     def __init__(self, in_channels, out_channels):
         super(UNet, self).__init__()
@@ -115,10 +136,12 @@ class PatchTST_backbone(nn.Module):
         if self.pretrain_head: 
             self.head = self.create_pretrain_head(self.head_nf, c_in, fc_dropout) # custom head passed as a partial func with all its kwargs
         elif head_type == 'flatten': 
-            self.head = Flatten_Head(self.individual, self.n_vars, self.head_nf, target_window, head_dropout=head_dropout)
+            self.head = Flatten_Head(self.individual, self.n_vars, 2*self.head_nf, target_window, head_dropout=head_dropout)
         
-        self.multi_scale = 15
-        self.unet = UNet(1, self.multi_scale)
+        self.multi_scale = 128
+        self.scale_factor = 4
+        self.unet = UNet(c_in, self.scale_factor * c_in)
+        self.de_scale = nn.Linear(int(self.scale_factor*self.patch_len/2), 128)
     def forward(self, z):                                                                   # z: [bs x nvars x seq_len]
         # norm
         if self.revin: 
@@ -126,23 +149,24 @@ class PatchTST_backbone(nn.Module):
             z = self.revin_layer(z, 'norm')
             z = z.permute(0,2,1)
 
-        multi_z = z.reshape(z.shape[0]*z.shape[1], -1)    
-        multi_z = self.unet(multi_z)
-        multi_z = multi_z.reshape(z.shape[0], z.shape[1], self.multi_scale, -1)
+        # multi_z = z.reshape(z.shape[0], z.shape[1], -1)    
+        # multi_z = self.unet(multi_z)
+        
         # do patching
         if self.padding_patch == 'end':
             z = self.padding_patch_layer(z)
-            multi_z = self.padding_patch_layer(multi_z)
-
         z = z.unfold(dimension=-1, size=self.patch_len, step=self.stride)                   # z: [bs x nvars x patch_num x patch_len]
-        origin_z = z.reshape(z.shape[0], z.shape[1], 1, -1, self.patch_len)
-        multi_z = multi_z.unfold(dimension=-1, size=self.patch_len, step=self.stride)
 
-        all_z = torch.cat((origin_z, multi_z), dim=2)
+        # multi_z = multi_z.reshape(z.shape[0], z.shape[1], z.shape[2], -1)
+        # multi_z = self.de_scale(multi_z)
+        #all_z = self.de_scale(all_z)
+        # z = all_z
         z = z.permute(0,1,3,2)                                                              # z: [bs x nvars x patch_len x patch_num]
         
         # model
+        #z = self.backbone(z)      + multi_z.permute(0,1,3,2)                                                          # z: [bs x nvars x d_model x patch_num]
         z = self.backbone(z)                                                                # z: [bs x nvars x d_model x patch_num]
+
         z = self.head(z)                                                                    # z: [bs x nvars x target_window] 
         
         # denorm
@@ -224,27 +248,59 @@ class TSTiEncoder(nn.Module):  #i means channel-independent
         self.encoder = TSTEncoder(q_len, d_model, n_heads, d_k=d_k, d_v=d_v, d_ff=d_ff, norm=norm, attn_dropout=attn_dropout, dropout=dropout,
                                    pre_norm=pre_norm, activation=act, res_attention=res_attention, n_layers=n_layers, store_attn=store_attn)
 
-        self.unet = UNet(c_in, c_in*16)
-        self.W_P_2 = nn.Linear(patch_len*16, d_model)
+        self.W_P_2 = nn.Linear(c_in*patch_len, c_in*d_model)
+        self.encoder_2 = TSTEncoder(q_len, d_model*c_in, n_heads, d_k=d_k, d_v=d_v, d_ff=d_ff, norm=norm, attn_dropout=attn_dropout, dropout=dropout,
+                                   pre_norm=pre_norm, activation=act, res_attention=res_attention, n_layers=n_layers, store_attn=store_attn)
+        self.out_scale = nn.Conv1d(1, c_in, 1)
+        self.weight = nn.Parameter(torch.tensor(1.0))
+        # 假设创建一个小型的Transformer编码器层来融合
+        self.fusion_transformer = nn.TransformerEncoderLayer(d_model=d_model*patch_num, nhead=8)
+        self.d_model = d_model
     def forward(self, x) -> Tensor:                                              # x: [bs x nvars x patch_len x patch_num]
         
         n_vars = x.shape[1]
+        bs = x.shape[0]
+        patch_len = x.shape[2]
+        patch_num = x.shape[3]
+
+        another_x = x
         # Input encoding/
         x = x.permute(0,1,3,2)                                                   # x: [bs x nvars x patch_num x patch_len]
-
-        unet_x = self.unet(x.reshape(x.shape[0], x.shape[1], -1))
-        unet_x = unet_x.reshape(x.shape[0], x.shape[1], x.shape[2], -1)
-        
-        x = self.W_P(x) + self.W_P_2(unet_x)                                                  # x: [bs x nvars x patch_num x d_model]
+        x = self.W_P(x)                                                # x: [bs x nvars x patch_num x d_model]
 
         u = torch.reshape(x, (x.shape[0]*x.shape[1],x.shape[2],x.shape[3]))      # u: [bs * nvars x patch_num x d_model]
+
+
+
         u = self.dropout(u + self.W_pos)                                         # u: [bs * nvars x patch_num x d_model]
 
         # Encoder
         z = self.encoder(u)                                                      # z: [bs * nvars x patch_num x d_model]
         z = torch.reshape(z, (-1,n_vars,z.shape[-2],z.shape[-1]))                # z: [bs x nvars x patch_num x d_model]
         z = z.permute(0,1,3,2)                                                   # z: [bs x nvars x d_model x patch_num]
+
+        another_u = another_x.permute(0,3,1,2)
+        another_u = another_u.reshape(another_u.shape[0], another_u.shape[1], -1)
+        another_u = self.W_P_2(another_u)
+        z_2 = self.dropout(u + self.W_pos) 
+        z_2 = self.encoder_2(another_u)
+        z_2 = z_2.reshape(z_2.shape[0], z_2.shape[1], z.shape[1],-1)
+        #z_2 = self.out_scale(z_2)
+        #z_2 = z_2.reshape(another_u.shape[0], n_vars, another_u.shape[1], -1)
+        z_2 = z_2.permute(0,2,3,1)
         
+        z = torch.cat((z,z_2), dim=2)
+        #z = z+z_2
+
+        # z = z.permute(0,1,3,2).reshape(z.shape[0]*z.shape[1],  -1)
+        # z_2 = z_2.permute(0,1,3,2).reshape(z_2.shape[0]*z_2.shape[1],  -1)
+        # # 将两个输出堆叠并处理为序列的两部分
+        # inputs_for_fusion = torch.stack((z, z_2), dim=1)
+        # merged_output = self.fusion_transformer(inputs_for_fusion)
+        # merged_output = merged_output.mean(dim=1)  # 或者使用其他策略整合序列信息
+
+        # z = merged_output.reshape(bs, n_vars, patch_num, self.d_model).permute(0,1,3,2)
+        #z = self.weight * z + (1-self.weight) * z_2
         return z    
             
             
