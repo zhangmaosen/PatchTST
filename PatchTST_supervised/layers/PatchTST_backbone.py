@@ -16,6 +16,25 @@ from layers.RevIN import RevIN
 import torch
 import torch.nn as nn
 
+class FeatureFusion(nn.Module):
+    def __init__(self, feature_dim1, feature_dim2, hidden_dim, fusion_dim):
+        super(FeatureFusion, self).__init__()
+        self.fc1 = nn.Linear(feature_dim1, hidden_dim)  # 全连接层1，用于特征1
+        self.fc2 = nn.Linear(feature_dim2, hidden_dim)  # 全连接层2，用于特征2
+        self.fusion = nn.Linear(hidden_dim * 2, fusion_dim)  # 全连接层3，用于融合两个特征
+
+    def forward(self, feature1, feature2):
+        # 对每个特征进行线性变换
+        out1 = self.fc1(feature1)
+        out2 = self.fc2(feature2)
+        
+        # 将两个特征向量拼接
+        fused_features = torch.cat((out1, out2), dim=-1)
+
+        # 使用融合层
+        fused_out = self.fusion(fused_features)
+
+        return fused_out
 
 class VGGTimeSeries(nn.Module):
     def __init__(self, input_dim, hidden_dim, output_dim):
@@ -40,11 +59,14 @@ class UNet(nn.Module):
     def __init__(self, in_channels, out_channels):
         super(UNet, self).__init__()
 
+        self.kernel_size = 3
+        self.padding = self.kernel_size // 2
+
         def conv_block(in_channels, out_channels):
             return nn.Sequential(
-                nn.Conv1d(in_channels, out_channels, 3, padding=1),
+                nn.Conv1d(in_channels, out_channels, self.kernel_size, padding=self.padding),
                 nn.ReLU(inplace=True),
-                nn.Conv1d(out_channels, out_channels, 3, padding=1),
+                nn.Conv1d(out_channels, out_channels, self.kernel_size, padding=self.padding),
                 nn.ReLU(inplace=True)
             )   
 
@@ -136,10 +158,10 @@ class PatchTST_backbone(nn.Module):
         if self.pretrain_head: 
             self.head = self.create_pretrain_head(self.head_nf, c_in, fc_dropout) # custom head passed as a partial func with all its kwargs
         elif head_type == 'flatten': 
-            self.head = Flatten_Head(self.individual, self.n_vars, 2*self.head_nf, target_window, head_dropout=head_dropout)
+            self.head = Flatten_Head(self.individual, self.n_vars, self.head_nf, target_window, head_dropout=head_dropout)
         
         self.multi_scale = 128
-        self.scale_factor = 4
+        self.scale_factor = 2
         self.unet = UNet(c_in, self.scale_factor * c_in)
         self.de_scale = nn.Linear(int(self.scale_factor*self.patch_len/2), 128)
     def forward(self, z):                                                                   # z: [bs x nvars x seq_len]
@@ -248,14 +270,28 @@ class TSTiEncoder(nn.Module):  #i means channel-independent
         self.encoder = TSTEncoder(q_len, d_model, n_heads, d_k=d_k, d_v=d_v, d_ff=d_ff, norm=norm, attn_dropout=attn_dropout, dropout=dropout,
                                    pre_norm=pre_norm, activation=act, res_attention=res_attention, n_layers=n_layers, store_attn=store_attn)
 
-        self.W_P_2 = nn.Linear(c_in*patch_len, c_in*d_model)
+        # exp
+        self.W_P_2 = nn.Linear(patch_len, d_model)
+        self.W_P_3 = nn.Linear(2*patch_len, d_model)
         self.encoder_2 = TSTEncoder(q_len, d_model*c_in, n_heads, d_k=d_k, d_v=d_v, d_ff=d_ff, norm=norm, attn_dropout=attn_dropout, dropout=dropout,
                                    pre_norm=pre_norm, activation=act, res_attention=res_attention, n_layers=n_layers, store_attn=store_attn)
         self.out_scale = nn.Conv1d(1, c_in, 1)
         self.weight = nn.Parameter(torch.tensor(1.0))
         # 假设创建一个小型的Transformer编码器层来融合
         self.fusion_transformer = nn.TransformerEncoderLayer(d_model=d_model*patch_num, nhead=8)
+        self.fusion_feature = 'add'
+
+        self.up_channel_factor = 1
+        print(f'backbone model is on the {self.fusion_feature} mode')
+        if self.fusion_feature == 'cat':
+            self.down_channel = nn.Conv1d((self.up_channel_factor+1)*c_in, c_in, 1)
+        else :
+            self.down_channel = nn.Conv1d((self.up_channel_factor)*c_in, c_in, 1)
         self.d_model = d_model
+        self.unet = UNet(c_in, c_in)
+        self.fusion = FeatureFusion(d_model, d_model, d_model*2, d_model)
+        
+
     def forward(self, x) -> Tensor:                                              # x: [bs x nvars x patch_len x patch_num]
         
         n_vars = x.shape[1]
@@ -263,10 +299,23 @@ class TSTiEncoder(nn.Module):  #i means channel-independent
         patch_len = x.shape[2]
         patch_num = x.shape[3]
 
-        another_x = x
+        # another_x = x
         # Input encoding/
         x = x.permute(0,1,3,2)                                                   # x: [bs x nvars x patch_num x patch_len]
-        x = self.W_P(x)                                                # x: [bs x nvars x patch_num x d_model]
+        
+
+        #unet_x = self.W_P_2(unet_x)
+
+        x = self.W_P(x)
+        unet_x = self.unet(x.reshape(bs, n_vars,patch_num*self.d_model))
+        unet_x = unet_x.reshape(bs, n_vars, patch_num, self.d_model)
+        #x = self.weight * x + (1- self.weight)* unet_x
+        
+
+
+
+        
+        #x = x + unet_x                                            # x: [bs x nvars x patch_num x d_model]
 
         u = torch.reshape(x, (x.shape[0]*x.shape[1],x.shape[2],x.shape[3]))      # u: [bs * nvars x patch_num x d_model]
 
@@ -276,31 +325,15 @@ class TSTiEncoder(nn.Module):  #i means channel-independent
 
         # Encoder
         z = self.encoder(u)                                                      # z: [bs * nvars x patch_num x d_model]
-        z = torch.reshape(z, (-1,n_vars,z.shape[-2],z.shape[-1]))                # z: [bs x nvars x patch_num x d_model]
+        #z = torch.reshape(z, (-1,n_vars,z.shape[-2]*z.shape[-1]))                # z: [bs x nvars x patch_num x d_model]
+
+        z = torch.reshape(z, (-1,n_vars,patch_num,self.d_model))
+        
+        z = self.fusion(z, unet_x) # todo
+
         z = z.permute(0,1,3,2)                                                   # z: [bs x nvars x d_model x patch_num]
 
-        another_u = another_x.permute(0,3,1,2)
-        another_u = another_u.reshape(another_u.shape[0], another_u.shape[1], -1)
-        another_u = self.W_P_2(another_u)
-        z_2 = self.dropout(u + self.W_pos) 
-        z_2 = self.encoder_2(another_u)
-        z_2 = z_2.reshape(z_2.shape[0], z_2.shape[1], z.shape[1],-1)
-        #z_2 = self.out_scale(z_2)
-        #z_2 = z_2.reshape(another_u.shape[0], n_vars, another_u.shape[1], -1)
-        z_2 = z_2.permute(0,2,3,1)
         
-        z = torch.cat((z,z_2), dim=2)
-        #z = z+z_2
-
-        # z = z.permute(0,1,3,2).reshape(z.shape[0]*z.shape[1],  -1)
-        # z_2 = z_2.permute(0,1,3,2).reshape(z_2.shape[0]*z_2.shape[1],  -1)
-        # # 将两个输出堆叠并处理为序列的两部分
-        # inputs_for_fusion = torch.stack((z, z_2), dim=1)
-        # merged_output = self.fusion_transformer(inputs_for_fusion)
-        # merged_output = merged_output.mean(dim=1)  # 或者使用其他策略整合序列信息
-
-        # z = merged_output.reshape(bs, n_vars, patch_num, self.d_model).permute(0,1,3,2)
-        #z = self.weight * z + (1-self.weight) * z_2
         return z    
             
             

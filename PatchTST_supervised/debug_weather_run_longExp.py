@@ -124,12 +124,13 @@ if __name__ == '__main__':
     args.stride = 8
     args.des = 'Exp'
     args.train_epochs = 100
-    args.patience = 7
+    args.patience = 3
     args.itr = 1
-    args.batch_size = 128
+    args.batch_size = 64
     args.learning_rate = 0.0001
-    args.lradj = 'type2'
+    args.lradj = 'TST'
     args.use_multi_gpu = False
+    #args.gpu = 2
     # random seed
     fix_seed = args.random_seed
     random.seed(fix_seed)
