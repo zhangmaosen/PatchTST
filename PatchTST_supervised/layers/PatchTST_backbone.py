@@ -289,9 +289,10 @@ class TSTiEncoder(nn.Module):  #i means channel-independent
             self.down_channel = nn.Conv1d((self.up_channel_factor)*c_in, c_in, 1)
         self.d_model = d_model
         self.unet = UNet(c_in, c_in)
+        self.unet_front = UNet(c_in, c_in)
         self.fusion = FeatureFusion(d_model, d_model, d_model*2, d_model)
-        
-
+        self.fusion_front = FeatureFusion(d_model, d_model, d_model*2, d_model)
+        self.fusion_all = FeatureFusion(d_model, patch_len, 2 * d_model, d_model)
     def forward(self, x) -> Tensor:                                              # x: [bs x nvars x patch_len x patch_num]
         
         n_vars = x.shape[1]
@@ -302,8 +303,7 @@ class TSTiEncoder(nn.Module):  #i means channel-independent
         # another_x = x
         # Input encoding/
         x = x.permute(0,1,3,2)                                                   # x: [bs x nvars x patch_num x patch_len]
-        
-
+    
         #unet_x = self.W_P_2(unet_x)
 
         x = self.W_P(x)
@@ -311,12 +311,8 @@ class TSTiEncoder(nn.Module):  #i means channel-independent
         unet_x = unet_x.reshape(bs, n_vars, patch_num, self.d_model)
         #x = self.weight * x + (1- self.weight)* unet_x
         
-
-
-
-        
         #x = x + unet_x                                            # x: [bs x nvars x patch_num x d_model]
-
+        
         u = torch.reshape(x, (x.shape[0]*x.shape[1],x.shape[2],x.shape[3]))      # u: [bs * nvars x patch_num x d_model]
 
 
@@ -329,7 +325,9 @@ class TSTiEncoder(nn.Module):  #i means channel-independent
 
         z = torch.reshape(z, (-1,n_vars,patch_num,self.d_model))
         
-        z = self.fusion(z, unet_x) # todo
+        z = self.fusion(z, x) # todo
+
+       
 
         z = z.permute(0,1,3,2)                                                   # z: [bs x nvars x d_model x patch_num]
 

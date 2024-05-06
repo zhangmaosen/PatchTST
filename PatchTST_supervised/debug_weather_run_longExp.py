@@ -94,7 +94,7 @@ if __name__ == '__main__':
 
     args = parser.parse_args()
 
-    seq_len = 336
+    seq_len = 512
     model_name = 'PatchTST'
     model_id_name = 'weather'
     data_name = 'custom'
@@ -128,9 +128,9 @@ if __name__ == '__main__':
     args.itr = 1
     args.batch_size = 64
     args.learning_rate = 0.0001
-    args.lradj = 'TST'
+    args.lradj = 'type3'
     args.use_multi_gpu = False
-    #args.gpu = 2
+    args.gpu = 3
     # random seed
     fix_seed = args.random_seed
     random.seed(fix_seed)
